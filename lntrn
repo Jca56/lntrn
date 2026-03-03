@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# ── lntrn ─────────────────────────────────────────────────────────────────────
+# A neofetch-style system info tool for Lantern Terminal.
+# Renders the lantern icon as ANSI half-block art alongside system info.
+# Dependencies: python3, python-pillow
+# Install: ln -sf "$(pwd)/lntrn" ~/.local/bin/lntrn
+
+set -euo pipefail
+
+# ── Resolve icon path ─────────────────────────────────────────────────────────
+# Check installed location first, then dev tree
+if [[ -f /usr/share/lntrn/lntrn.png ]]; then
+    ICON="/usr/share/lntrn/lntrn.png"
+else
+    SCRIPT_PATH="$(readlink -f "$0")"
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    ICON="$SCRIPT_DIR/assets/lntrn.png"
+fi
+
+if [[ ! -f "$ICON" ]]; then
+    echo "Error: Icon not found at $ICON"
+    exit 1
+fi
+
+# ── System info gathering ─────────────────────────────────────────────────────
+USER_NAME="${USER:-$(whoami)}"
+HOST_NAME="${HOSTNAME:-$(hostname)}"
+DISTRO=$(grep -m1 "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+KERNEL=$(uname -sr)
+SHELL_NAME=$(basename "${SHELL:-unknown}")
+UPTIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
+TERMINAL="${TERM_PROGRAM:-${TERMINAL:-unknown}}"
+[[ "$TERMINAL" == "unknown" ]] && TERMINAL=$(ps -o comm= -p "$(ps -o ppid= -p $$)" 2>/dev/null || echo "unknown")
+
+CPU=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ //' | sed 's/(R)//g; s/(TM)//g; s/CPU //g')
+CPU=${CPU:-"unknown"}
+
+if [[ -f /proc/meminfo ]]; then
+    MEM_TOTAL=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
+    MEM_AVAIL=$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)
+    MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
+    MEMORY="${MEM_USED}MiB / ${MEM_TOTAL}MiB"
+else
+    MEMORY="unknown"
+fi
+
+if command -v pacman &>/dev/null; then
+    PKG_COUNT=$(pacman -Q 2>/dev/null | wc -l)
+    PACKAGES="${PKG_COUNT} (pacman)"
+elif command -v dpkg &>/dev/null; then
+    PKG_COUNT=$(dpkg -l 2>/dev/null | grep -c '^ii')
+    PACKAGES="${PKG_COUNT} (dpkg)"
+elif command -v rpm &>/dev/null; then
+    PKG_COUNT=$(rpm -qa 2>/dev/null | wc -l)
+    PACKAGES="${PKG_COUNT} (rpm)"
+else
+    PACKAGES="unknown"
+fi
+
+if [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
+    DE_WM="$XDG_CURRENT_DESKTOP"
+elif [[ -n "${DESKTOP_SESSION:-}" ]]; then
+    DE_WM="$DESKTOP_SESSION"
+else
+    DE_WM="unknown"
+fi
+
+DE_VERSION=""
+if command -v plasmashell &>/dev/null; then
+    DE_VERSION=$(plasmashell --version 2>/dev/null | awk '{print $2}')
+elif command -v gnome-shell &>/dev/null; then
+    DE_VERSION=$(gnome-shell --version 2>/dev/null | awk '{print $3}')
+elif command -v xfce4-session &>/dev/null; then
+    DE_VERSION=$(xfce4-session --version 2>/dev/null | head -1 | awk '{print $2}')
+elif command -v cinnamon &>/dev/null; then
+    DE_VERSION=$(cinnamon --version 2>/dev/null | awk '{print $2}')
+fi
+[[ -n "$DE_VERSION" ]] && DE_WM="$DE_WM $DE_VERSION"
+
+GPU=$(lspci 2>/dev/null | grep -i 'vga\|3d\|display' | head -1 | sed 's/.*: //' | sed 's/ Corporation//;s/ \[.*//;s/ (.*//;s/Intel /Intel /' | cut -c1-40)
+GPU=${GPU:-"unknown"}
+
+# ── Render icon + system info ─────────────────────────────────────────────────
+export LNTRN_USER="$USER_NAME"
+export LNTRN_HOST="$HOST_NAME"
+export LNTRN_DISTRO="$DISTRO"
+export LNTRN_KERNEL="$KERNEL"
+export LNTRN_SHELL="$SHELL_NAME"
+export LNTRN_TERMINAL="$TERMINAL"
+export LNTRN_UPTIME="$UPTIME"
+export LNTRN_PACKAGES="$PACKAGES"
+export LNTRN_DE="$DE_WM"
+export LNTRN_CPU="$CPU"
+export LNTRN_GPU="$GPU"
+export LNTRN_MEMORY="$MEMORY"
+
+python3 - "$ICON" << 'PYEOF'
+import sys, os
+from PIL import Image
+
+img = Image.open(sys.argv[1]).convert('RGBA')
+W = 24
+H = int(W * img.height / img.width / 2 + 0.5) * 2
+img = img.resize((W, H), Image.LANCZOS)
+
+# Fix LANCZOS resampling artifacts at high-contrast boundaries
+import math
+pixels = img.load()
+fixes = []
+for y in range(H):
+    for x in range(W):
+        r, g, b, a = pixels[x, y]
+        if a < 80:
+            continue
+        neighbors = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    nr, ng, nb, na = pixels[nx, ny]
+                    if na > 80:
+                        neighbors.append((nr, ng, nb))
+        if len(neighbors) < 3:
+            continue
+        avg = tuple(sum(c[i] for c in neighbors) // len(neighbors) for i in range(3))
+        dist = math.sqrt(sum((a - b) ** 2 for a, b in zip((r, g, b), avg)))
+        if dist > 70:
+            fixes.append((x, y, (*avg, 255)))
+for x, y, color in fixes:
+    pixels[x, y] = color
+
+raw = img.tobytes()
+
+def px(x, y):
+    i = (y * W + x) * 4
+    return (raw[i], raw[i+1], raw[i+2], raw[i+3])
+
+art_lines = []
+for y in range(0, H, 2):
+    parts = []
+    for x in range(W):
+        top = px(x, y)
+        bot = px(x, y + 1) if y + 1 < H else (0, 0, 0, 0)
+        ta, ba = top[3], bot[3]
+        if ta > 80 and ba > 80:
+            parts.append(f"\033[48;2;{top[0]};{top[1]};{top[2]}m\033[38;2;{bot[0]};{bot[1]};{bot[2]}m▄")
+        elif ta > 80:
+            parts.append(f"\033[0m\033[38;2;{top[0]};{top[1]};{top[2]}m▀")
+        elif ba > 80:
+            parts.append(f"\033[0m\033[38;2;{bot[0]};{bot[1]};{bot[2]}m▄")
+        else:
+            parts.append("\033[0m ")
+    art_lines.append("".join(parts) + "\033[0m")
+
+O = "\033[38;2;212;160;32m"
+B = "\033[1m"
+R = "\033[0m"
+D = "\033[38;2;120;90;55m"
+user = os.environ.get('LNTRN_USER', '?')
+host = os.environ.get('LNTRN_HOST', '?')
+
+info = [
+    f"  {B}{O}{user}{R}{D}@{R}{B}{O}{host}{R}",
+    f"  {D}──────────────────────────{R}",
+    f"  {O}OS{R}        {os.environ.get('LNTRN_DISTRO', '?')}",
+    f"  {O}Kernel{R}    {os.environ.get('LNTRN_KERNEL', '?')}",
+    f"  {O}Shell{R}     {os.environ.get('LNTRN_SHELL', '?')}",
+    f"  {O}Terminal{R}  {os.environ.get('LNTRN_TERMINAL', '?')}",
+    f"  {O}Uptime{R}    {os.environ.get('LNTRN_UPTIME', '?')}",
+    f"  {O}Packages{R}  {os.environ.get('LNTRN_PACKAGES', '?')}",
+    f"  {O}DE/WM{R}     {os.environ.get('LNTRN_DE', '?')}",
+    f"  {O}CPU{R}       {os.environ.get('LNTRN_CPU', '?')}",
+    f"  {O}GPU{R}       {os.environ.get('LNTRN_GPU', '?')}",
+    f"  {O}Memory{R}    {os.environ.get('LNTRN_MEMORY', '?')}",
+    "",
+    f"  \033[38;2;255;200;60m●\033[38;2;212;160;32m●\033[38;2;180;140;80m●\033[38;2;120;90;55m●\033[38;2;80;60;35m●\033[38;2;120;90;55m●\033[38;2;180;140;80m●\033[38;2;212;160;32m●{R}",
+]
+
+print()
+COL = W + 6
+for i in range(max(len(art_lines), len(info))):
+    art = art_lines[i] if i < len(art_lines) else ""
+    inf = info[i] if i < len(info) else ""
+    print(f"  {art}\033[{COL}G{inf}")
+print()
+PYEOF

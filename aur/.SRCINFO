@@ -1,0 +1,17 @@
+pkgbase = lntrn-git
+	pkgdesc = A neofetch-style system info tool for Lantern DE — renders a lantern icon as ANSI half-block art alongside system info
+	pkgver = r1.g0000000
+	pkgrel = 1
+	url = https://github.com/Jca56/lntrn
+	arch = any
+	license = custom
+	makedepends = git
+	depends = bash
+	depends = python
+	depends = python-pillow
+	provides = lntrn
+	conflicts = lntrn
+	source = lntrn-git::git+https://github.com/Jca56/lntrn.git
+	sha256sums = SKIP
+
+pkgname = lntrn-git
