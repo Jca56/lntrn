@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ── lntrn ─────────────────────────────────────────────────────────────────────
-# A neofetch-style system info tool for Lantern Terminal.
-# Renders the lantern icon as ANSI half-block art alongside system info.
+# Displays system information alongside an ANSI Lantern - For Lantern DE
 # Dependencies: python3, python-pillow
 # Install: ln -sf "$(pwd)/lntrn" ~/.local/bin/lntrn
 
