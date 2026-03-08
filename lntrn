@@ -64,20 +64,91 @@ else
     DE_WM="unknown"
 fi
 
-DE_VERSION=""
-if command -v plasmashell &>/dev/null; then
-    DE_VERSION=$(plasmashell --version 2>/dev/null | awk '{print $2}')
-elif command -v gnome-shell &>/dev/null; then
-    DE_VERSION=$(gnome-shell --version 2>/dev/null | awk '{print $3}')
-elif command -v xfce4-session &>/dev/null; then
-    DE_VERSION=$(xfce4-session --version 2>/dev/null | head -1 | awk '{print $2}')
-elif command -v cinnamon &>/dev/null; then
-    DE_VERSION=$(cinnamon --version 2>/dev/null | awk '{print $2}')
+# Only append version for non-Lantern DEs
+if [[ "$DE_WM" != "Lantern" ]]; then
+    DE_VERSION=""
+    if command -v plasmashell &>/dev/null; then
+        DE_VERSION=$(plasmashell --version 2>/dev/null | awk '{print $2}')
+    elif command -v gnome-shell &>/dev/null; then
+        DE_VERSION=$(gnome-shell --version 2>/dev/null | awk '{print $3}')
+    elif command -v xfce4-session &>/dev/null; then
+        DE_VERSION=$(xfce4-session --version 2>/dev/null | head -1 | awk '{print $2}')
+    elif command -v cinnamon &>/dev/null; then
+        DE_VERSION=$(cinnamon --version 2>/dev/null | awk '{print $2}')
+    fi
+    [[ -n "$DE_VERSION" ]] && DE_WM="$DE_WM $DE_VERSION"
 fi
-[[ -n "$DE_VERSION" ]] && DE_WM="$DE_WM $DE_VERSION"
 
 GPU=$(lspci 2>/dev/null | grep -i 'vga\|3d\|display' | head -1 | sed 's/.*: //' | sed 's/ Corporation//;s/ \[.*//;s/ (.*//;s/Intel /Intel /' | cut -c1-40)
 GPU=${GPU:-"unknown"}
+
+# ── Display server ────────────────────────────────────────────────────────────
+if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    DISPLAY_SERVER="Wayland"
+elif [[ -n "${DISPLAY:-}" ]]; then
+    DISPLAY_SERVER="X11"
+else
+    DISPLAY_SERVER="tty"
+fi
+
+# ── Monitor detection ─────────────────────────────────────────────────────────
+MONITORS=""
+for drm_dir in /sys/class/drm/card*-*/; do
+    [[ -f "$drm_dir/status" ]] || continue
+    [[ "$(cat "$drm_dir/status" 2>/dev/null)" == "connected" ]] || continue
+
+    output=$(basename "$drm_dir")
+    # Strip card prefix → DP-1, HDMI-A-1, eDP-1 etc
+    output=${output#card*-}
+
+    res=$(head -1 "$drm_dir/modes" 2>/dev/null)
+    res=${res:-"?"}
+
+    # Parse EDID for monitor model name
+    mon_name=""
+    if [[ -f "$drm_dir/edid" ]]; then
+        mon_name=$(python3 -c "
+import sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        edid = f.read()
+    if len(edid) >= 128:
+        for i in range(4):
+            off = 54 + i * 18
+            if edid[off+3] == 0xFC:
+                print(edid[off+5:off+18].decode('ascii', errors='ignore').strip())
+                sys.exit()
+        # Fallback: manufacturer code
+        m = (edid[8] << 8) | edid[9]
+        mfg = chr(((m>>10)&0x1F)+64) + chr(((m>>5)&0x1F)+64) + chr((m&0x1F)+64)
+        print(mfg)
+except: pass
+" "$drm_dir/edid" 2>/dev/null)
+    fi
+
+    if [[ -n "$mon_name" ]]; then
+        entry="$mon_name ($output) $res"
+    else
+        entry="$output $res"
+    fi
+
+    if [[ -z "$MONITORS" ]]; then
+        MONITORS="$entry"
+    else
+        MONITORS="$MONITORS|$entry"
+    fi
+done
+MONITORS=${MONITORS:-"unknown"}
+
+# ── Battery (laptop only) ────────────────────────────────────────────────────
+BATTERY=""
+for bat in /sys/class/power_supply/BAT*; do
+    [[ -f "$bat/capacity" ]] || continue
+    pct=$(cat "$bat/capacity" 2>/dev/null)
+    status=$(cat "$bat/status" 2>/dev/null)
+    BATTERY="${pct}% (${status})"
+    break
+done
 
 # ── Render icon + system info ─────────────────────────────────────────────────
 export LNTRN_USER="$USER_NAME"
@@ -92,6 +163,9 @@ export LNTRN_DE="$DE_WM"
 export LNTRN_CPU="$CPU"
 export LNTRN_GPU="$GPU"
 export LNTRN_MEMORY="$MEMORY"
+export LNTRN_DISPLAY="$DISPLAY_SERVER"
+export LNTRN_MONITORS="$MONITORS"
+export LNTRN_BATTERY="$BATTERY"
 
 python3 - "$ICON" << 'PYEOF'
 import sys, os
@@ -160,6 +234,41 @@ D = "\033[38;2;120;90;55m"
 user = os.environ.get('LNTRN_USER', '?')
 host = os.environ.get('LNTRN_HOST', '?')
 
+def lerp(a, b, t):
+    return int(round(a + (b - a) * t))
+
+def sample_gradient(colors, t):
+    if t <= 0:
+        return colors[0]
+    if t >= 1:
+        return colors[-1]
+    pos = t * (len(colors) - 1)
+    idx = int(pos)
+    frac = pos - idx
+    c1 = colors[idx]
+    c2 = colors[min(idx + 1, len(colors) - 1)]
+    return tuple(lerp(c1[i], c2[i], frac) for i in range(3))
+
+def strip_ansi(text):
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\033":
+            i += 1
+            if i < len(text) and text[i] == "[":
+                i += 1
+                while i < len(text) and text[i] != "m":
+                    i += 1
+                if i < len(text):
+                    i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+def dot_row(colors):
+    return "  " + " ".join(f"\033[38;2;{r};{g};{b}m⬤" for r, g, b in colors) + R
+
 info = [
     f"  {B}{O}{user}{R}{D}@{R}{B}{O}{host}{R}",
     f"  {D}──────────────────────────{R}",
@@ -170,15 +279,50 @@ info = [
     f"  {O}Uptime{R}    {os.environ.get('LNTRN_UPTIME', '?')}",
     f"  {O}Packages{R}  {os.environ.get('LNTRN_PACKAGES', '?')}",
     f"  {O}DE/WM{R}     {os.environ.get('LNTRN_DE', '?')}",
+    f"  {O}Display{R}   {os.environ.get('LNTRN_DISPLAY', '?')}",
+]
+
+# Add monitors right after Display
+monitors = os.environ.get('LNTRN_MONITORS', '')
+if monitors:
+    mons = monitors.split('|')
+    info.append(f"  {O}Monitor{R}   {mons[0]}")
+    for m in mons[1:]:
+        info.append(f"            {m}")
+
+info.extend([
     f"  {O}CPU{R}       {os.environ.get('LNTRN_CPU', '?')}",
     f"  {O}GPU{R}       {os.environ.get('LNTRN_GPU', '?')}",
     f"  {O}Memory{R}    {os.environ.get('LNTRN_MEMORY', '?')}",
-    "",
-    f"  \033[38;2;255;200;60m●\033[38;2;212;160;32m●\033[38;2;180;140;80m●\033[38;2;120;90;55m●\033[38;2;80;60;35m●\033[38;2;120;90;55m●\033[38;2;180;140;80m●\033[38;2;212;160;32m●{R}",
+])
+
+# Battery — only shown on laptops
+battery = os.environ.get('LNTRN_BATTERY', '')
+if battery:
+    info.append(f"  {O}Battery{R}   {battery}")
+
+info.append("")
+info.append(dot_row([
+    (180, 130, 70),
+    (150, 110, 65),
+    (120, 90, 55),
+    (95, 75, 50),
+    (75, 60, 40),
+    (95, 75, 50),
+    (120, 90, 55),
+    (150, 110, 65),
+]))
+gradient_stops = [
+    (255, 105, 180),
+    (59, 130, 246),
+    (34, 197, 94),
+    (250, 204, 21),
+    (239, 68, 68),
 ]
+info.append(dot_row([sample_gradient(gradient_stops, i / 7) for i in range(8)]))
 
 print()
-COL = W + 6
+COL = W + 8
 for i in range(max(len(art_lines), len(info))):
     art = art_lines[i] if i < len(art_lines) else ""
     inf = info[i] if i < len(info) else ""
